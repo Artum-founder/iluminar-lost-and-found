@@ -18,6 +18,7 @@ type PublicClaimRow = {
   name: string;
   how: string;
   note: string;
+  picked: number;
   at: number;
 };
 
@@ -25,12 +26,15 @@ type CrewClaimRow = PublicClaimRow & {
   contact: string;
   owner: string;
   ownerContact: string;
+  proof: string;
+  reach: string;
 };
 
 type VoteRow = { tag: string; bin: number | null; keep: number | null };
 type StatusRow = { tag: string; status: string };
 type CountRow = { n: number | null };
 type HashRow = { hash: string };
+type TagRow = { tag: string; type: string };
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -116,8 +120,10 @@ async function statuses(db: D1Database): Promise<Record<string, string>> {
 async function publicState(db: D1Database) {
   const claims = await db
     .prepare(
-      "SELECT id, tag, type, wish, name, how, CASE WHEN type = 'want' THEN note ELSE '' END AS note, created_at AS at " +
-        "FROM claims WHERE hidden = 0 ORDER BY created_at",
+      // Once the crew has picked the real owner, the other "it's mine" claims leave the public page.
+      "SELECT id, tag, type, wish, name, how, CASE WHEN type = 'want' THEN note ELSE '' END AS note, picked, created_at AS at " +
+        "FROM claims c WHERE hidden = 0 AND NOT (type = 'mine' AND picked = 0 AND EXISTS (" +
+        "SELECT 1 FROM claims p WHERE p.tag = c.tag AND p.type = 'mine' AND p.picked = 1 AND p.hidden = 0)) ORDER BY created_at",
     )
     .all<PublicClaimRow>();
   return { claims: claims.results ?? [], votes: await voteCounts(db), status: await statuses(db) };
@@ -126,7 +132,7 @@ async function publicState(db: D1Database) {
 async function crewState(db: D1Database) {
   const claims = await db
     .prepare(
-      "SELECT id, tag, type, wish, name, how, note, contact, owner, owner_contact AS ownerContact, created_at AS at " +
+      "SELECT id, tag, type, wish, name, how, note, contact, owner, owner_contact AS ownerContact, proof, reach, picked, created_at AS at " +
         "FROM claims WHERE hidden = 0 ORDER BY created_at DESC",
     )
     .all<CrewClaimRow>();
@@ -145,16 +151,22 @@ async function postClaim(request: Request, db: D1Database): Promise<Response> {
   const wish = type === "mine" ? oneOf(body.wish, ["back", "donate", "none"] as const, "back") : "";
   const how = type === "know" ? oneOf(body.how, ["tell", "crew"] as const, "tell") : "";
   const name = str(body.name, 60);
-  const contact = str(body.contact, 120);
+  // "facebook" means: no phone or email, they will message the crew on Facebook instead.
+  let reach = type === "know" ? "" : oneOf(body.reach, ["contact", "facebook"] as const, "contact");
+  let contact = str(body.contact, 120);
   const owner = str(body.owner, 80);
   const ownerContact = how === "crew" ? str(body.ownerContact, 120) : "";
   const note = str(body.note, 300);
+  const proof = type === "mine" ? str(body.proof, 300) : "";
+  if (type === "mine" && wish !== "back") reach = "";
+  if (type === "know" || reach !== "contact") contact = "";
 
   if (type === "mine" && !name) return json({ error: "Name missing" }, 400);
-  if (type === "mine" && wish === "back" && !contact) return json({ error: "Contact missing" }, 400);
+  if (type === "mine" && wish === "back" && reach === "contact" && !contact) return json({ error: "Contact missing" }, 400);
   if (type === "know" && !owner) return json({ error: "Owner missing" }, 400);
   if (type === "know" && how === "crew" && !ownerContact) return json({ error: "Owner contact missing" }, 400);
-  if (type === "want" && (!name || !contact)) return json({ error: "Name or contact missing" }, 400);
+  if (type === "want" && !name) return json({ error: "Name missing" }, 400);
+  if (type === "want" && reach === "contact" && !contact) return json({ error: "Contact missing" }, 400);
 
   const ip = request.headers.get("cf-connecting-ip") ?? "unknown";
   const ipHash = await sha256Hex("lost-and-found:" + ip);
@@ -168,10 +180,10 @@ async function postClaim(request: Request, db: D1Database): Promise<Response> {
   const id = crypto.randomUUID();
   await db
     .prepare(
-      "INSERT INTO claims (id, tag, type, wish, name, contact, owner, how, owner_contact, note, ip_hash, hidden, created_at) " +
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+      "INSERT INTO claims (id, tag, type, wish, name, contact, owner, how, owner_contact, note, proof, reach, ip_hash, hidden, created_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
     )
-    .bind(id, tag, type, wish, name, type === "know" ? "" : contact, owner, how, ownerContact, note, ipHash, now)
+    .bind(id, tag, type, wish, name, contact, owner, how, ownerContact, note, proof, reach, ipHash, now)
     .run();
   return json({ ok: true, id });
 }
@@ -229,6 +241,25 @@ async function hideClaim(request: Request, db: D1Database): Promise<Response> {
   return json({ ok: true });
 }
 
+// Crew settles a disputed item: this claim is the real owner (or undo that).
+async function pickClaim(request: Request, db: D1Database): Promise<Response> {
+  const body = await readJson(request);
+  if (!body) return json({ error: "Bad request" }, 400);
+  const id = str(body.id, 64);
+  if (!id) return json({ error: "Bad request" }, 400);
+  const row = await db.prepare("SELECT tag, type FROM claims WHERE id = ? AND hidden = 0").bind(id).first<TagRow>();
+  if (!row || row.type !== "mine") return json({ error: "Not found" }, 404);
+  if (body.undo === true) {
+    await db.prepare("UPDATE claims SET picked = 0 WHERE id = ?").bind(id).run();
+  } else {
+    await db.batch([
+      db.prepare("UPDATE claims SET picked = 0 WHERE tag = ? AND type = 'mine'").bind(row.tag),
+      db.prepare("UPDATE claims SET picked = 1 WHERE id = ?").bind(id),
+    ]);
+  }
+  return json({ ok: true });
+}
+
 /** Handles /api/* for the lost and found. Returns null for paths it does not own. */
 export async function handleLostFoundApi(request: Request, url: URL): Promise<Response | null> {
   if (!url.pathname.startsWith("/api/")) return null;
@@ -245,6 +276,7 @@ export async function handleLostFoundApi(request: Request, url: URL): Promise<Re
       if (path === "/api/crew" && method === "GET") return json(await crewState(db));
       if (path === "/api/crew/status" && method === "POST") return await setStatus(request, db);
       if (path === "/api/crew/claim-delete" && method === "POST") return await hideClaim(request, db);
+      if (path === "/api/crew/pick" && method === "POST") return await pickClaim(request, db);
     }
     return json({ error: "Not found" }, 404);
   } catch (err) {
